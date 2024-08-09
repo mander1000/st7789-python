@@ -1,5 +1,5 @@
 # Copyright (c) 2014 Adafruit Industries
-# Author: Tony DiCola
+# Author: Tony DiCola (Forked and Modified by Maik Ender)
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -21,15 +21,16 @@
 import numbers
 import time
 
-import gpiod
-import gpiodevice
+# import gpiod
+# import gpiodevice
 import numpy
 import spidev
-from gpiod.line import Direction, Value
+# from gpiod.line import Direction, Value
+import RPi.GPIO
 
 __version__ = "1.0.1"
 
-OUTL = gpiod.LineSettings(direction=Direction.OUTPUT, output_value=Value.INACTIVE)
+# OUTL = gpiod.LineSettings(direction=Direction.OUTPUT, output_value=Value.INACTIVE)
 
 BG_SPI_CS_BACK = 0
 BG_SPI_CS_FRONT = 1
@@ -92,12 +93,15 @@ ST7789_PWCTR6 = 0xFC
 
 class ST7789(object):
     """Representation of an ST7789 TFT LCD."""
+    VARIANT_ST7789 = 1
+    VARIANT_ST7789V = 2
 
     def __init__(
         self,
         port,
-        cs,
+        spi_device,
         dc,
+        spi_cs=None,
         backlight=None,
         rst=None,
         width=240,
@@ -107,6 +111,9 @@ class ST7789(object):
         spi_speed_hz=4000000,
         offset_left=0,
         offset_top=0,
+        display_enable=None,
+        variant=VARIANT_ST7789,
+        gpio_instance=None,
     ):
         """Create an instance of the display using SPI communication.
 
@@ -115,7 +122,8 @@ class ST7789(object):
         Can optionally provide the GPIO pin number for the reset pin as the rst parameter.
 
         :param port: SPI port number
-        :param cs: SPI chip-select number (0 or 1 for BCM
+        :param spi_device: SPI device (0 or 1 for BCM)
+        :param spi_cs: SPI chip-select pin
         :param backlight: Pin for controlling backlight
         :param rst: Reset pin for ST7789
         :param width: Width of display connected to ST7789
@@ -123,6 +131,9 @@ class ST7789(object):
         :param rotation: Rotation of display connected to ST7789
         :param invert: Invert display
         :param spi_speed_hz: SPI speed (in Hz)
+        :param display_enable: Display EN pin I/O to enable or disable the whole module
+        :param variant: Display variant [ST7789, ST7789V]
+        :param gpio_instance: Instance of RPi.GPIO if used somewhere else
 
         """
         if rotation not in [0, 90, 180, 270]:
@@ -133,12 +144,10 @@ class ST7789(object):
                 f"Invalid rotation {rotation} for {width}x{height} resolution"
             )
 
-        gpiodevice.friendly_errors = True
-
-        self._spi = spidev.SpiDev(port, cs)
-        self._spi.mode = 0
-        self._spi.lsbfirst = False
-        self._spi.max_speed_hz = spi_speed_hz
+        self._spi_port = port
+        self._spi_device = spi_device
+        self._spi_speed_hz = spi_speed_hz
+        self._spi_cs = spi_cs
 
         self._dc = dc
         self._rst = rst
@@ -149,26 +158,42 @@ class ST7789(object):
 
         self._offset_left = offset_left
         self._offset_top = offset_top
+        
 
         # Set DC as output.
-        self._dc = gpiodevice.get_pin(dc, "st7789-dc", OUTL)
+        self._dc = dc
 
         # Setup backlight as output (if provided).
-        if backlight is not None:
-            self._bl = gpiodevice.get_pin(backlight, "st7789-bl", OUTL)
-            self.set_pin(self._bl, False)
-            time.sleep(0.1)
-            self.set_pin(self._bl, True)
+        self._bl = backlight
 
         # Setup reset as output (if provided).
-        if rst is not None:
-            self._rst = gpiodevice.get_pin(rst, "st7789-rst", OUTL)
+        self._rst = rst
 
-        self._init()
+        # display enable
+        self._display_en = display_enable
+
+        self._active = False
+
+        if variant not in [self.VARIANT_ST7789, self.VARIANT_ST7789V]:
+            raise ValueError(f"Invalid variant {variant}")
+        self._variant = variant
+
+        if gpio_instance:
+            self._GPIO = gpio_instance
+        else:
+            self._GPIO = RPi.GPIO
+            self._GPIO.setmode(self._GPIO.BCM)
+        
+        self.activate()
+        print("display init finished")
 
     def set_pin(self, pin, state):
-        lines, offset = pin
-        lines.set_value(offset, Value.ACTIVE if state else Value.INACTIVE)
+        self._GPIO.output(pin, state)
+
+
+    def spi_writebyte(self, data):
+        if self._spi != None:
+            self._spi.writebytes(data)
 
     def send(self, data, is_data=True, chunk_size=4096):
         """Write a byte or array of bytes to the display. Is_data parameter
@@ -188,6 +213,9 @@ class ST7789(object):
 
     def set_backlight(self, value):
         """Set the backlight on/off."""
+        if not self._active:
+            print("NOT active")
+            return True
         if self._bl is not None:
             self.set_pin(self._bl, value)
 
@@ -225,14 +253,90 @@ class ST7789(object):
             self.set_pin(self._rst, True)
             time.sleep(0.500)
 
-    def _init(self):
-        # Initialize the display.
+    def _init_gpio(self):
 
+        self._spi = spidev.SpiDev(self._spi_port, self._spi_device)
+        self._spi.mode = 0
+        self._spi.lsbfirst = False
+        self._spi.max_speed_hz = self._spi_speed_hz
+        # spi chip select
+        if self._spi_cs:
+            self._GPIO.setup(self._spi_cs, self._GPIO.OUT)
+
+        self._GPIO.setup(self._dc, self._GPIO.OUT)
+
+        # Setup backlight as output (if provided).
+        if self._bl is not None:
+            self._bl = self._bl
+            self._GPIO.setup(self._bl, self._GPIO.OUT)
+            self.set_pin(self._bl, True)
+            
+        # Setup reset as output (if provided).
+        if self._rst is not None:
+            self._GPIO.setup(self._rst, self._GPIO.OUT)
+        
+        # display enable
+        if self._display_en:
+            self._GPIO.setup(self._display_en, self._GPIO.OUT)
+            self.set_pin(self._display_en, True)
+
+
+    def _exit_gpio(self):
+
+        if self._spi != None:
+            self._spi.close()
+            self._spi = None
+
+        # spi chip select
+        if self._spi_cs:
+            self._GPIO.setup(self._spi_cs, self._GPIO.IN, pull_up_down=self._GPIO.PUD_UP)
+
+        self.set_pin(self._rst, True)
+        self.set_pin(self._dc, False)
+
+        self._GPIO.setup(self._dc, self._GPIO.IN, pull_up_down=self._GPIO.PUD_OFF)
+        
+        # reset BL (if provided)
+        if self._bl:
+            self._GPIO.setup(self._bl, self._GPIO.IN, pull_up_down=self._GPIO.PUD_OFF)
+
+        # reset rst (if provided)
+        if self._rst:
+            self._GPIO.setup(self._rst, self._GPIO.IN, pull_up_down=self._GPIO.PUD_OFF)
+        
+        # disable display completly (if provided)
+        if self._display_en:
+            self.set_pin(self._display_en, False)
+
+    def deactivate(self):
+        if not self._active:
+            return True
+        print("active -- DEactivating")
+        self._exit_gpio()
+        self._active = False
+    
+    def activate(self):
+        if self._active:
+            return True
+        print("NOT active -- activating")
+        self._init_gpio()
+        self._init()
+        self._active = True
+
+    def _init(self):
+        # self._init_gpio()
+
+        # Initialize the display.
         self.command(ST7789_SWRESET)  # Software reset
         time.sleep(0.150)  # delay 150 ms
 
+        self.reset()
+
         self.command(ST7789_MADCTL)
-        self.data(0x70)
+        if self._variant == self.VARIANT_ST7789:
+            self.data(0x70)
+        elif self._variant == self.VARIANT_ST7789V:
+            self.data(0x00)
 
         self.command(ST7789_FRMCTR2)  # Frame rate ctrl - idle mode
         self.data(0x0C)
@@ -245,10 +349,14 @@ class ST7789(object):
         self.data(0x05)
 
         self.command(ST7789_GCTRL)
-        self.data(0x14)
+        # self.data(0x14)
+        self.data(0x35)
 
         self.command(ST7789_VCOMS)
-        self.data(0x37)
+        if self._variant == self.VARIANT_ST7789:
+            self.data(0x37)
+        elif self._variant == self.VARIANT_ST7789V:
+            self.data(0x1F)
 
         self.command(ST7789_LCMCTRL)  # Power control
         self.data(0x2C)
@@ -266,40 +374,72 @@ class ST7789(object):
         self.data(0xA4)
         self.data(0xA1)
 
-        self.command(ST7789_FRCTRL2)
+        self.command(ST7789_FRCTRL2) #(umsortiert mit vorherigem)
         self.data(0x0F)
 
         self.command(ST7789_GMCTRP1)  # Set Gamma
-        self.data(0xD0)
-        self.data(0x04)
-        self.data(0x0D)
-        self.data(0x11)
-        self.data(0x13)
-        self.data(0x2B)
-        self.data(0x3F)
-        self.data(0x54)
-        self.data(0x4C)
-        self.data(0x18)
-        self.data(0x0D)
-        self.data(0x0B)
-        self.data(0x1F)
-        self.data(0x23)
+        if self._variant == self.VARIANT_ST7789:
+            self.data(0xD0)
+            self.data(0x04)
+            self.data(0x0D)
+            self.data(0x11)
+            self.data(0x13)
+            self.data(0x2B)
+            self.data(0x3F)
+            self.data(0x54)
+            self.data(0x4C)
+            self.data(0x18)
+            self.data(0x0D)
+            self.data(0x0B)
+            self.data(0x1F)
+            self.data(0x23)
+        elif self._variant == self.VARIANT_ST7789V:
+            self.data(0xD0)
+            self.data(0x08)
+            self.data(0x11)
+            self.data(0x08)
+            self.data(0x0C)
+            self.data(0x15)
+            self.data(0x39)
+            self.data(0x33)
+            self.data(0x50)
+            self.data(0x36)
+            self.data(0x13)
+            self.data(0x14)
+            self.data(0x29)
+            self.data(0x2D)
 
         self.command(ST7789_GMCTRN1)  # Set Gamma
-        self.data(0xD0)
-        self.data(0x04)
-        self.data(0x0C)
-        self.data(0x11)
-        self.data(0x13)
-        self.data(0x2C)
-        self.data(0x3F)
-        self.data(0x44)
-        self.data(0x51)
-        self.data(0x2F)
-        self.data(0x1F)
-        self.data(0x1F)
-        self.data(0x20)
-        self.data(0x23)
+        if self._variant == self.VARIANT_ST7789:
+            self.data(0xD0)
+            self.data(0x04)
+            self.data(0x0C)
+            self.data(0x11)
+            self.data(0x13)
+            self.data(0x2C)
+            self.data(0x3F)
+            self.data(0x44)
+            self.data(0x51)
+            self.data(0x2F)
+            self.data(0x1F)
+            self.data(0x1F)
+            self.data(0x20)
+            self.data(0x23)
+        elif self._variant == self.VARIANT_ST7789V:
+            self.data(0xD0)
+            self.data(0x08)
+            self.data(0x10)
+            self.data(0x08)
+            self.data(0x06)
+            self.data(0x06)
+            self.data(0x39)
+            self.data(0x44)
+            self.data(0x51)
+            self.data(0x0B)
+            self.data(0x16)
+            self.data(0x14)
+            self.data(0x2F)
+            self.data(0x31)
 
         if self._invert:
             self.command(ST7789_INVON)  # Invert display
@@ -319,7 +459,7 @@ class ST7789(object):
         """
         pass
 
-    def set_window(self, x0=0, y0=0, x1=None, y1=None):
+    def _set_window(self, x0=0, y0=0, x1=None, y1=None):
         """Set the pixel address window for proceeding drawing commands. x0 and
         x1 should define the minimum and maximum x pixel bounds.  y0 and y1
         should define the minimum and maximum y pixel bound.  If no parameters
@@ -356,8 +496,14 @@ class ST7789(object):
         :param image: Should be RGB format and the same dimensions as the display hardware.
 
         """
+        if not self._active:
+            print("NOT active")
+            return True
+        if self._variant == self.VARIANT_ST7789V:
+            self.command(ST7789_MADCTL)
+            self.data(0x70)
         # Set address bounds to entire display.
-        self.set_window()
+        self._set_window()
 
         # Convert image to 16bit RGB565 format and
         # flatten into bytes.
